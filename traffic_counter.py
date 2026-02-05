@@ -1,8 +1,11 @@
 import argparse
 import os
+import re
 import time
 from datetime import datetime
 from typing import Optional
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 import cv2
 import pandas as pd
@@ -89,28 +92,58 @@ def side_with_deadzone(x_center: float, x_line: int, deadzone: int) -> Optional[
     return None
 
 
+
+
+def _extract_stream_from_html(page_url: str) -> Optional[str]:
+    """Fallback: próbuje znaleźć URL streamu bezpośrednio w HTML strony."""
+    req = Request(page_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=15) as resp:  # nosec - user provided URL
+        html = resp.read().decode("utf-8", errors="ignore")
+
+    # Najpierw szukamy bezpośrednich URL-i streamu
+    media_patterns = [
+        r'https?://[^"\'\s>]+\.m3u8[^"\'\s>]*',
+        r'https?://[^"\'\s>]+\.mp4[^"\'\s>]*',
+        r'rtsp://[^"\'\s>]+',
+    ]
+    for pattern in media_patterns:
+        m = re.search(pattern, html, flags=re.IGNORECASE)
+        if m:
+            return m.group(0)
+
+    # Często stream jest w iframe - spróbujmy wejść poziom głębiej
+    iframe_match = re.search(r'<iframe[^>]+src=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    if iframe_match:
+        iframe_url = urljoin(page_url, iframe_match.group(1))
+        req_iframe = Request(iframe_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urlopen(req_iframe, timeout=15) as resp:  # nosec - user provided URL
+            iframe_html = resp.read().decode("utf-8", errors="ignore")
+
+        for pattern in media_patterns:
+            m = re.search(pattern, iframe_html, flags=re.IGNORECASE)
+            if m:
+                return m.group(0)
+
+    return None
 def resolve_webpage_to_stream(url: str) -> str:
     """Próbuje zamienić URL strony (np. z osadzoną kamerą) na bezpośredni URL streamu."""
+    info = None
+    ytdlp_error = None
+
     try:
         from yt_dlp import YoutubeDL
+
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "extract_flat": False,
+        }
+
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
     except Exception as exc:
-        raise RuntimeError(
-            "Źródło wygląda na stronę WWW, ale nie mogę odczytać streamu. "
-            "Zainstaluj yt-dlp: pip install yt-dlp"
-        ) from exc
-
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "extract_flat": False,
-    }
-
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-
-    if info is None:
-        raise RuntimeError(f"Nie udało się odczytać streamu ze strony: {url}")
+        ytdlp_error = exc
 
     if isinstance(info, dict):
         if info.get("url"):
@@ -125,6 +158,18 @@ def resolve_webpage_to_stream(url: str) -> str:
             ext = (f.get("ext") or "").lower()
             if "m3u8" in protocol or ext in {"mp4", "m3u8", "ts"}:
                 return candidate
+
+    fallback = _extract_stream_from_html(url)
+    if fallback:
+        print("[INFO] yt-dlp nie obsłużył linku. Używam fallback HTML.")
+        return fallback
+
+    if ytdlp_error is not None:
+        raise RuntimeError(
+            "Nie udało się odczytać streamu ze strony przez yt-dlp ani fallback HTML. "
+            "Podaj bezpośredni URL przez --stream_url (np. .m3u8). "
+            f"Szczegóły yt-dlp: {ytdlp_error}"
+        ) from ytdlp_error
 
     raise RuntimeError(f"Nie znalazłem bezpośredniego URL streamu dla: {url}")
 
